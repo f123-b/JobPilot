@@ -66,6 +66,34 @@ class JobBatchIngestRequest(BaseModel):
     jobs: list[JobCandidate] = Field(min_length=1, max_length=100)
 
 
+class AgentPlanStep(BaseModel):
+    agent: Literal["resume", "search", "ranking", "browser", "evaluate"]
+    objective: str = Field(min_length=3)
+
+
+class AgentPlan(BaseModel):
+    goal: str
+    rationale: str = ""
+    steps: list[AgentPlanStep] = Field(default_factory=list)
+    planner_backend: Literal["llm", "heuristic"] = "heuristic"
+
+
+class ResumeProfile(BaseModel):
+    skills: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    experience_years: int | None = None
+    keywords: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class RankedJob(BaseModel):
+    job: JobCandidate
+    score: int = Field(ge=0, le=100)
+    matched_skills: list[str] = Field(default_factory=list)
+    missing_skills: list[str] = Field(default_factory=list)
+    explanation: str = ""
+
+
 class BrowserTaskRequest(BaseModel):
     objective: str = Field(min_length=10)
     task_type: Literal["research", "job_search", "application"] = "research"

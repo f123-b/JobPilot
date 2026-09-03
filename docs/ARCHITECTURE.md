@@ -1,81 +1,225 @@
-# JobPilot V0.2 Architecture
+# JobPilot V0.3-1 Architecture
 
-## Goal
+## 1. Goal
 
-JobPilot is an AI job-search and browser-automation agent. V0.2 focuses on agent engineering rather than a single prompt-to-browser call:
+V0.3-1 converts JobPilot from a single browser-execution graph into a role-separated multi-agent runtime. The main design requirement is not merely "more agents"; each specialist owns a distinct responsibility and the parent graph controls handoffs, retries and safety boundaries.
 
-- explicit workflow orchestration with LangGraph;
-- structured Browser Use output for job discovery;
-- deterministic job deduplication and persistence;
-- skill + embedding resume/JD matching;
-- execution evaluation, retry and replanning;
-- human approval before high-impact application actions;
-- WebSocket task trace for observability.
+Specialists:
 
-## Runtime architecture
+- **Planner Agent** — task decomposition and objective refinement;
+- **Resume Agent** — evidence-grounded candidate profile extraction;
+- **Search Agent** — structured job discovery;
+- **Ranking Agent** — resume/job scoring;
+- **Browser Agent** — research or approved application execution;
+- **Evaluation Agent** — quality gate and retry decision.
 
-```text
-Browser / UI
-    |
-    v
-FastAPI ---------------------------------------------------+
-    |                                                      |
-    | REST                                                 | WebSocket trace
-    v                                                      |
-Task / Job APIs                                            |
-    |                                                      |
-    v                                                      |
-SQLite <----------- Trace / Task / Job state --------------+
-    ^
-    |
-LangGraph Workflow
-    |
-    +--> prepare
-    +--> Browser Use Agent
-    +--> evaluator
-    |       +--> pass -> finish
-    |       +--> retryable -> replanner -> Browser Agent
-    +--> persist result / evaluation
-```
-
-## Agent state machine
+## 2. Parent graph
 
 ```text
-START -> prepare -> execute -> evaluate -> finish -> END
-                         ^          |
-                         |          | retryable
-                         +-- replan-+
+START
+  |
+prepare
+  |
+planner
+  |
+  +-- job_search + resume --> resume --> search --> ranking --> evaluate
+  |
+  +-- job_search ----------> search -----------> evaluate
+  |
+  +-- research ------------> browser ----------> evaluate
+  |
+  +-- application + resume -> resume --> browser -> evaluate
+  |
+  +-- application ---------> browser ----------> evaluate
+                                                   |
+                                  +----------------+---------------+
+                                  |                                |
+                                pass                           retryable
+                                  |                                |
+                                  v                                v
+                                finish                           replan
+                                  |                                |
+                                 END               search/browser branch only
+                                                                   |
+                                                               evaluate
 ```
 
-`AGENT_MAX_RETRIES` caps retry loops. The evaluator uses task success, final result presence, action history, errors, step count and duration as auditable signals.
+`AGENT_MAX_RETRIES` limits replanning loops.
 
-## Job discovery and deduplication
+## 3. Planner design
 
-For `job_search` tasks Browser Use is configured with `output_model_schema=DiscoveredJobs`. A SHA-256 fingerprint from normalized title/company/location/url prevents duplicate rows.
+The Planner has two backends:
 
-## Resume matching
+1. `llm` — produces a structured plan when an OpenAI-compatible model is configured;
+2. `heuristic` — deterministic fallback for local/demo operation.
 
-V0.2 combines explicit skill evidence and embedding similarity. OpenAI-compatible embeddings are used when configured; deterministic signed feature hashing is used in offline demo mode.
+The LLM does not have final authority over the execution route. Its output is canonicalized using `task_type` and resume availability:
 
 ```text
-final_score = 0.70 * skill_score + 0.30 * semantic_score
+job_search + resume -> resume, search, ranking, evaluate
+job_search          -> search, evaluate
+research            -> browser, evaluate
+application + resume-> resume, browser, evaluate
+application         -> browser, evaluate
 ```
 
-## Human-in-the-loop
+This design separates **agentic objective planning** from **deterministic safety policy**.
 
-`application` tasks always require explicit approval. The agent must not invent candidate information, bypass access controls, or guess ambiguous fields.
+## 4. Shared graph state
 
-## Observability
+The LangGraph state includes:
 
-Trace events include task creation, approval, graph preparation, agent attempts, action history, job ingestion, evaluation, replanning and final workflow state. `/ws/tasks/{task_id}` streams them to the UI.
+```text
+task_id
+task
+attempt
+plan
+remaining_steps
+current_agent
+resume_profile
+run
+candidates
+ranked_jobs
+evaluation
+final_status
+```
 
-## Production roadmap
+The SQLite `tasks` table separately persists:
 
-- PostgreSQL + pgvector/Qdrant
-- multi-source connectors and scheduled discovery
-- authenticated browser profiles
-- LangGraph checkpointer for durable execution
-- reranking model
-- OpenTelemetry / LangSmith-compatible tracing
-- evaluation dataset and regression benchmark
-- queue worker instead of in-process BackgroundTasks
+```text
+plan_json
+workflow_json
+current_agent
+workflow_thread_id
+retry_count
+evaluation_json
+```
+
+`workflow_thread_id` is introduced now so V0.3-2 can attach a persistent LangGraph checkpointer without changing the task identity model.
+
+## 5. Agent responsibilities
+
+### Planner Agent
+
+Inputs:
+
+- objective;
+- task type;
+- resume presence;
+- target URL.
+
+Outputs:
+
+- `AgentPlan.goal`;
+- rationale;
+- ordered typed `AgentPlanStep[]`.
+
+### Resume Agent
+
+V0.3-1 intentionally does **not** claim full RAG. It extracts conservative, explicit resume evidence:
+
+- recognized skills;
+- verbatim evidence snippets;
+- simple experience-year hints;
+- keywords.
+
+V0.3-2 will replace/extend this with chunk-level vector retrieval.
+
+### Search Agent
+
+Search uses Browser Use as the browser execution engine but is isolated as a specialist role. It must return `DiscoveredJobs`, which is converted to typed `JobCandidate` objects and deduplicated into SQLite.
+
+### Ranking Agent
+
+For bulk ranking, V0.3-1 uses the deterministic hybrid matcher rather than one LLM call per job:
+
+```text
+score = 0.70 * explicit_skill_score + 0.30 * embedding_similarity
+```
+
+This keeps cost bounded and ranking reproducible. The direct `/api/match` endpoint may still use an LLM to calibrate a single resume/JD comparison.
+
+### Browser Agent
+
+Used for:
+
+- general web research;
+- approved application tasks.
+
+Application guardrails remain enforced in the Browser prompt and, more importantly, by the outer approval gate before the graph starts.
+
+### Evaluation Agent
+
+The evaluator considers:
+
+- Browser success flag;
+- final-result presence;
+- action history;
+- errors;
+- step count;
+- duration;
+- structured job-candidate count for `job_search`.
+
+A `job_search` run with no structured candidates is forced to fail the quality gate even if the browser call itself returned a nominal success.
+
+## 6. Targeted replanning
+
+V0.2 retried the generic Browser Agent. V0.3-1 replans the failed branch:
+
+```text
+job_search failure
+  -> Search Agent
+  -> Ranking Agent (if resume exists)
+  -> Evaluation Agent
+
+research/application failure
+  -> Browser Agent
+  -> Evaluation Agent
+```
+
+Completed Resume extraction does not need to run again during a transient browser retry.
+
+## 7. Observability
+
+New trace events include:
+
+- `planner_plan`
+- `agent_handoff`
+- `resume_agent_result`
+- `search_agent_start`
+- `search_agent_result`
+- `ranking_agent_result`
+- `browser_agent_start`
+- `browser_agent_result`
+- `evaluation`
+- `planner_replan`
+- `graph_finish`
+- `workflow_error`
+
+The WebSocket task status also streams the currently active agent and pending workflow sequence.
+
+## 8. Human-in-the-loop
+
+The parent task API is still the security boundary:
+
+```text
+application
+   |
+waiting_approval
+   |
+explicit approve
+   |
+Multi-Agent graph starts
+```
+
+Planner output cannot remove this gate because planning occurs only after `prepare_node` verifies approval.
+
+## 9. V0.3-2 integration points
+
+The graph is prepared for the next phase:
+
+- replace basic Resume Agent extraction with chunked RAG;
+- persist resume embeddings in pgvector/Qdrant;
+- retrieve evidence snippets inside Ranking Agent;
+- add long-term user/job memory;
+- compile the graph with a durable LangGraph checkpointer using `workflow_thread_id`.

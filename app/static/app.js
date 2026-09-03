@@ -1,1 +1,146 @@
-const $=(id)=>document.getElementById(id);let currentTask=null;let traceSocket=null;async function api(path,options={}){const res=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const data=await res.json();if(!res.ok)throw new Error(data.detail||JSON.stringify(data));return data}function pretty(x){return JSON.stringify(x,null,2)}function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));btn.classList.add('active');$(btn.dataset.tab).classList.add('active');if(btn.dataset.tab==='jobs')loadJobs()});(async()=>{try{const h=await api('/api/health');$('health').textContent=h.browser_agent_configured?`V${h.version} · Agent ready`:`V${h.version} · Demo mode`}catch{$('health').textContent='Offline'}})();$('parseBtn').onclick=async()=>{$('matchOut').textContent='解析中…';try{$('matchOut').textContent=pretty(await api('/api/jd/parse',{method:'POST',body:JSON.stringify({text:$('jd').value})}))}catch(e){$('matchOut').textContent=e.message}};$('matchBtn').onclick=async()=>{$('matchOut').textContent='计算 Skill + Embedding 匹配…';try{$('matchOut').textContent=pretty(await api('/api/match',{method:'POST',body:JSON.stringify({resume_text:$('resume').value,jd_text:$('jd').value})}))}catch(e){$('matchOut').textContent=e.message}};$('runBtn').onclick=async()=>{$('agentOut').textContent='创建任务…';$('traceList').innerHTML='<div class="muted">等待 workflow 启动…</div>';$('approvalBox').classList.add('hidden');if(traceSocket)traceSocket.close();try{const data=await api('/api/tasks',{method:'POST',body:JSON.stringify({objective:$('objective').value,task_type:$('taskType').value,job_url:$('jobUrl').value||null,resume_text:$('resume').value||null,auto_execute:false})});currentTask=data.id;$('agentOut').textContent=pretty(data);connectTrace(currentTask);if(data.status==='waiting_approval')$('approvalBox').classList.remove('hidden')}catch(e){$('agentOut').textContent=e.message}};$('approveBtn').onclick=async()=>{if(!currentTask)return;$('approvalBox').classList.add('hidden');try{const data=await api(`/api/tasks/${currentTask}/approve`,{method:'POST',body:JSON.stringify({approved:true,note:'Approved from JobPilot UI'})});$('agentOut').textContent=pretty(data)}catch(e){$('agentOut').textContent=e.message}};function connectTrace(taskId){const protocol=location.protocol==='https:'?'wss':'ws';traceSocket=new WebSocket(`${protocol}://${location.host}/ws/tasks/${taskId}`);traceSocket.onmessage=(ev)=>{const msg=JSON.parse(ev.data);if(msg.type==='trace')appendTrace(msg.data);if(msg.type==='status')$('agentOut').textContent=pretty(msg.data);if(msg.type==='done'){$('agentOut').textContent=pretty(msg.data);if(msg.data.task_type==='job_search')loadJobs()}};traceSocket.onerror=()=>appendTrace({event_type:'websocket_error',created_at:'',detail:{message:'Trace WebSocket disconnected'}})}function appendTrace(trace){const empty=$('traceList').querySelector('.muted');if(empty)$('traceList').innerHTML='';const item=document.createElement('div');item.className='trace';item.innerHTML=`<div class="trace-head"><strong>${escapeHtml(trace.event_type)}</strong><span>${escapeHtml((trace.created_at||'').slice(11,19))}</span></div><pre>${escapeHtml(pretty(trace.detail||{}))}</pre>`;$('traceList').appendChild(item);$('traceList').scrollTop=$('traceList').scrollHeight}async function loadJobs(){try{const jobs=await api('/api/jobs');$('jobsList').innerHTML=jobs.length?jobs.map(j=>`<div class="card"><div class="card-top"><h3>${escapeHtml(j.title)}</h3><span>${j.match_score??'-'}</span></div><div class="muted">${escapeHtml(j.company||'未知公司')} · ${escapeHtml(j.location||'未知地点')}</div><div class="muted">${escapeHtml(j.source||'unknown source')}</div>${j.url?`<a href="${escapeHtml(j.url)}" target="_blank" rel="noreferrer">打开岗位</a>`:''}</div>`).join(''):'暂无岗位记录'}catch(e){$('jobsList').textContent=e.message}}$('refreshJobs').onclick=loadJobs;
+const $ = (id) => document.getElementById(id);
+let currentTask = null;
+let traceSocket = null;
+
+async function api(path, options={}) {
+  const res = await fetch(path, {headers:{'Content-Type':'application/json'}, ...options});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+  return data;
+}
+
+function pretty(x){ return JSON.stringify(x,null,2); }
+function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+
+function requestPayload(autoExecute=false){
+  return {
+    objective:$('objective').value,
+    task_type:$('taskType').value,
+    job_url:$('jobUrl').value||null,
+    resume_text:$('resume').value||null,
+    auto_execute:autoExecute
+  };
+}
+
+function resetAgentBar(){
+  document.querySelectorAll('#workflowBar [data-agent]').forEach(el=>el.classList.remove('active-agent','done-agent','planned-agent'));
+}
+
+function renderPlan(plan){
+  resetAgentBar();
+  const agents=(plan?.steps||[]).map(x=>x.agent);
+  agents.forEach(agent=>document.querySelector(`#workflowBar [data-agent="${agent}"]`)?.classList.add('planned-agent'));
+}
+
+function setActiveAgent(agent){
+  if(!agent)return;
+  const el=document.querySelector(`#workflowBar [data-agent="${agent}"]`);
+  if(el){
+    document.querySelectorAll('#workflowBar [data-agent].active-agent').forEach(x=>{x.classList.remove('active-agent');x.classList.add('done-agent')});
+    el.classList.remove('planned-agent');
+    el.classList.add('active-agent');
+  }
+}
+
+document.querySelectorAll('.tab').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));
+  btn.classList.add('active'); $(btn.dataset.tab).classList.add('active');
+  if (btn.dataset.tab === 'jobs') loadJobs();
+});
+
+(async()=>{
+  try{
+    const h=await api('/api/health');
+    $('health').textContent = h.browser_agent_configured ? `V${h.version} · Multi-Agent ready` : `V${h.version} · Planner demo`;
+  }catch{$('health').textContent='Offline'}
+})();
+
+$('parseBtn').onclick = async()=>{
+  $('matchOut').textContent='解析中…';
+  try{$('matchOut').textContent=pretty(await api('/api/jd/parse',{method:'POST',body:JSON.stringify({text:$('jd').value})}));}
+  catch(e){$('matchOut').textContent=e.message}
+};
+
+$('matchBtn').onclick = async()=>{
+  $('matchOut').textContent='计算 Skill + Embedding 匹配…';
+  try{$('matchOut').textContent=pretty(await api('/api/match',{method:'POST',body:JSON.stringify({resume_text:$('resume').value,jd_text:$('jd').value})}));}
+  catch(e){$('matchOut').textContent=e.message}
+};
+
+$('planBtn').onclick = async()=>{
+  $('agentOut').textContent='Planner 生成计划…';
+  resetAgentBar();
+  try{
+    const plan=await api('/api/plan',{method:'POST',body:JSON.stringify(requestPayload(false))});
+    renderPlan(plan);
+    $('agentOut').textContent=pretty(plan);
+  }catch(e){$('agentOut').textContent=e.message}
+};
+
+$('runBtn').onclick = async()=>{
+  $('agentOut').textContent='创建任务…';
+  $('traceList').innerHTML='<div class="muted">等待 Planner 启动…</div>';
+  $('approvalBox').classList.add('hidden');
+  resetAgentBar();
+  if (traceSocket) traceSocket.close();
+  try{
+    const data=await api('/api/tasks',{method:'POST',body:JSON.stringify(requestPayload(false))});
+    currentTask=data.id;
+    $('agentOut').textContent=pretty(data);
+    connectTrace(currentTask);
+    if(data.status==='waiting_approval') $('approvalBox').classList.remove('hidden');
+  }catch(e){$('agentOut').textContent=e.message}
+};
+
+$('approveBtn').onclick = async()=>{
+  if(!currentTask)return;
+  $('approvalBox').classList.add('hidden');
+  try{
+    const data = await api(`/api/tasks/${currentTask}/approve`,{method:'POST',body:JSON.stringify({approved:true,note:'Approved from JobPilot UI'})});
+    $('agentOut').textContent=pretty(data);
+  }catch(e){$('agentOut').textContent=e.message}
+};
+
+function connectTrace(taskId){
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  traceSocket = new WebSocket(`${protocol}://${location.host}/ws/tasks/${taskId}`);
+  traceSocket.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'trace') appendTrace(msg.data);
+    if (msg.type === 'status') {
+      if(msg.data.plan) renderPlan(msg.data.plan);
+      setActiveAgent(msg.data.current_agent);
+      $('agentOut').textContent = pretty(msg.data);
+    }
+    if (msg.type === 'done') {
+      setActiveAgent(msg.data.current_agent);
+      document.querySelectorAll('#workflowBar [data-agent].active-agent').forEach(x=>{x.classList.remove('active-agent');x.classList.add('done-agent')});
+      $('agentOut').textContent = pretty(msg.data);
+      if (msg.data.task_type === 'job_search') loadJobs();
+    }
+  };
+  traceSocket.onerror = () => appendTrace({event_type:'websocket_error',created_at:'',detail:{message:'Trace WebSocket disconnected'}});
+}
+
+function appendTrace(trace){
+  const empty = $('traceList').querySelector('.muted');
+  if (empty) $('traceList').innerHTML='';
+  const item = document.createElement('div');
+  item.className='trace';
+  item.innerHTML=`<div class="trace-head"><strong>${escapeHtml(trace.event_type)}</strong><span>${escapeHtml((trace.created_at||'').slice(11,19))}</span></div><pre>${escapeHtml(pretty(trace.detail||{}))}</pre>`;
+  $('traceList').appendChild(item);
+  $('traceList').scrollTop=$('traceList').scrollHeight;
+}
+
+async function loadJobs(){
+  try{
+    const jobs=await api('/api/jobs');
+    $('jobsList').innerHTML=jobs.length?jobs.map(j=>`<div class="card">
+      <div class="card-top"><h3>${escapeHtml(j.title)}</h3><span class="score">${j.match_score ?? '-'}</span></div>
+      <div class="muted">${escapeHtml(j.company||'未知公司')} · ${escapeHtml(j.location||'未知地点')}</div>
+      <div class="muted">${escapeHtml(j.source||'unknown source')}</div>
+      ${j.url ? `<a href="${escapeHtml(j.url)}" target="_blank" rel="noreferrer">打开岗位</a>` : ''}
+    </div>`).join(''):'暂无岗位记录';
+  } catch(e){ $('jobsList').textContent=e.message; }
+}
+$('refreshJobs').onclick=loadJobs;

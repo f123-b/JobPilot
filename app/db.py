@@ -64,6 +64,10 @@ def init_db() -> None:
                 error_text TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 evaluation_json TEXT,
+                plan_json TEXT,
+                workflow_json TEXT,
+                current_agent TEXT,
+                workflow_thread_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -78,14 +82,20 @@ def init_db() -> None:
             );
             """
         )
+        # Backward-compatible migrations from V0.1 / V0.2 databases.
         _ensure_column(conn, "jobs", "location", "TEXT")
         _ensure_column(conn, "jobs", "source", "TEXT")
         _ensure_column(conn, "jobs", "fingerprint", "TEXT")
         _ensure_column(conn, "jobs", "updated_at", "TEXT")
         _ensure_column(conn, "tasks", "retry_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "tasks", "evaluation_json", "TEXT")
+        _ensure_column(conn, "tasks", "plan_json", "TEXT")
+        _ensure_column(conn, "tasks", "workflow_json", "TEXT")
+        _ensure_column(conn, "tasks", "current_agent", "TEXT")
+        _ensure_column(conn, "tasks", "workflow_thread_id", "TEXT")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs(fingerprint) WHERE fingerprint IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_task_id ON traces(task_id, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, id)")
         conn.commit()
 
 
@@ -97,7 +107,14 @@ def _normalize(value: str | None) -> str:
 
 
 def job_fingerprint(data: dict[str, Any]) -> str:
-    stable = "|".join([_normalize(data.get("title")), _normalize(data.get("company")), _normalize(data.get("location")), _normalize(data.get("url"))])
+    stable = "|".join(
+        [
+            _normalize(data.get("title")),
+            _normalize(data.get("company")),
+            _normalize(data.get("location")),
+            _normalize(data.get("url")),
+        ]
+    )
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
 
 
@@ -110,17 +127,24 @@ def save_job(data: dict[str, Any]) -> dict[str, Any]:
             conn.execute(
                 """UPDATE jobs SET title=?, company=?, location=?, url=?, jd_text=?, source=?,
                    match_score=COALESCE(?, match_score), updated_at=? WHERE id=?""",
-                (data["title"], data.get("company"), data.get("location"), data.get("url"), data.get("jd_text", ""), data.get("source"), data.get("match_score"), now, existing["id"]),
+                (
+                    data["title"], data.get("company"), data.get("location"), data.get("url"),
+                    data.get("jd_text", ""), data.get("source"), data.get("match_score"), now, existing["id"],
+                ),
             )
             conn.commit()
-            return get_job(existing["id"])
+            return get_job(existing["id"])  # type: ignore[return-value]
+
         cur = conn.execute(
             """INSERT INTO jobs(title, company, location, url, jd_text, source, fingerprint,
                match_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data["title"], data.get("company"), data.get("location"), data.get("url"), data.get("jd_text", ""), data.get("source"), fingerprint, data.get("match_score"), now, now),
+            (
+                data["title"], data.get("company"), data.get("location"), data.get("url"),
+                data.get("jd_text", ""), data.get("source"), fingerprint, data.get("match_score"), now, now,
+            ),
         )
         conn.commit()
-        return get_job(cur.lastrowid)
+        return get_job(cur.lastrowid)  # type: ignore[return-value]
 
 
 def ingest_jobs(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -143,7 +167,7 @@ def get_job(job_id: int) -> dict[str, Any] | None:
 
 def list_jobs(limit: int = 100) -> list[dict[str, Any]]:
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("SELECT * FROM jobs ORDER BY COALESCE(match_score, -1) DESC, id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -156,10 +180,21 @@ def create_task(objective: str, task_type: str, payload: dict[str, Any], require
                retry_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)""",
             (objective, task_type, status, int(requires_approval), None, json.dumps(payload, ensure_ascii=False), now, now),
         )
-        conn.commit()
         task_id = cur.lastrowid
-    add_trace(task_id, "task_created", {"status": status, "requires_approval": requires_approval})
-    return get_task(task_id)
+        thread_id = f"jobpilot-task-{task_id}"
+        conn.execute("UPDATE tasks SET workflow_thread_id=? WHERE id=?", (thread_id, task_id))
+        conn.commit()
+    add_trace(task_id, "task_created", {"status": status, "requires_approval": requires_approval, "thread_id": thread_id})
+    return get_task(task_id)  # type: ignore[return-value]
+
+
+def _load_json(value: str | None) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
 
 
 def get_task(task_id: int) -> dict[str, Any] | None:
@@ -168,18 +203,22 @@ def get_task(task_id: int) -> dict[str, Any] | None:
         if not row:
             return None
         d = dict(row)
-        d["payload"] = json.loads(d.pop("payload_json"))
+        d["payload"] = _load_json(d.pop("payload_json")) or {}
         d["requires_approval"] = bool(d["requires_approval"])
         d["approved"] = None if d["approved"] is None else bool(d["approved"])
-        d["evaluation"] = json.loads(d.pop("evaluation_json")) if d.get("evaluation_json") else None
+        d["evaluation"] = _load_json(d.pop("evaluation_json", None))
+        d["plan"] = _load_json(d.pop("plan_json", None))
+        d["workflow"] = _load_json(d.pop("workflow_json", None))
         return d
 
 
 def update_task(task_id: int, **fields: Any) -> None:
     if not fields:
         return
-    if "evaluation" in fields:
-        fields["evaluation_json"] = json.dumps(fields.pop("evaluation"), ensure_ascii=False)
+    for source, target in (("evaluation", "evaluation_json"), ("plan", "plan_json"), ("workflow", "workflow_json")):
+        if source in fields:
+            value = fields.pop(source)
+            fields[target] = json.dumps(value, ensure_ascii=False, default=str) if value is not None else None
     fields["updated_at"] = _now()
     keys = list(fields)
     values = [fields[k] for k in keys]
@@ -198,10 +237,13 @@ def approve_task(task_id: int, approved: bool, note: str | None = None) -> dict[
 
 def add_trace(task_id: int, event_type: str, detail: dict[str, Any]) -> dict[str, Any]:
     with _lock, _connect() as conn:
-        cur = conn.execute("INSERT INTO traces(task_id, event_type, detail_json, created_at) VALUES (?, ?, ?, ?)", (task_id, event_type, json.dumps(detail, ensure_ascii=False, default=str), _now()))
+        cur = conn.execute(
+            "INSERT INTO traces(task_id, event_type, detail_json, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, event_type, json.dumps(detail, ensure_ascii=False, default=str), _now()),
+        )
         conn.commit()
         trace_id = cur.lastrowid
-    return get_trace(trace_id)
+    return get_trace(trace_id)  # type: ignore[return-value]
 
 
 def get_trace(trace_id: int) -> dict[str, Any] | None:
@@ -210,16 +252,18 @@ def get_trace(trace_id: int) -> dict[str, Any] | None:
         if not row:
             return None
         d = dict(row)
-        d["detail"] = json.loads(d.pop("detail_json"))
+        d["detail"] = _load_json(d.pop("detail_json")) or {}
         return d
 
 
 def list_traces(task_id: int, after_id: int = 0) -> list[dict[str, Any]]:
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM traces WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM traces WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id)
+        ).fetchall()
         out = []
         for row in rows:
             d = dict(row)
-            d["detail"] = json.loads(d.pop("detail_json"))
+            d["detail"] = _load_json(d.pop("detail_json")) or {}
             out.append(d)
         return out

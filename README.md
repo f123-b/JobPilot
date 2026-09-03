@@ -1,47 +1,99 @@
 # JobPilot
 
-AI Job Search & Browser Agent built for agent-engineering practice and portfolio use.
+**JobPilot V0.3-1** is a multi-agent job-search platform built for AI application / Agent engineering practice and portfolio use.
 
-**V0.2** upgrades the MVP into a real workflow: **LangGraph orchestration + Browser Use + structured job discovery + deduplication + embedding matching + evaluation/replanning + Human-in-the-loop + WebSocket trace**.
+This stage upgrades V0.2 from a single Browser Agent workflow into a **Planner-orchestrated LangGraph runtime** with specialized Resume, Search, Ranking, Browser and Evaluation agents. The system keeps Human-in-the-loop boundaries for application tasks and persists the generated plan, active agent and workflow state for observability.
 
-## Features
+## What changed in V0.3-1
 
-- **JD Parser** — structured extraction with LLM and offline heuristic fallback.
-- **Resume/JD Matching** — explicit skill coverage + embedding similarity; no fabricated experience.
-- **Browser Agent** — Browser Use task execution for research, job discovery and approved applications.
-- **Structured Job Search** — `output_model_schema` produces typed job records that are persisted automatically.
-- **Job Deduplication** — stable fingerprint prevents repeated listings from polluting the database.
-- **LangGraph Workflow** — prepare → execute → evaluate → retry/replan → finish.
-- **Agent Evaluation** — quality score from success/result/actions/errors/steps/duration.
-- **Human-in-the-loop** — application tasks always require explicit approval.
-- **Live Trace** — WebSocket task timeline in the UI.
-- **Offline Demo Mode** — parser and matching still work without API keys.
+- **Planner Agent** — decomposes the user goal and produces a typed execution plan. Uses an LLM when configured and a deterministic fallback otherwise.
+- **Safe plan canonicalization** — the planner may refine step objectives, but cannot bypass approval or invent unrelated execution routes.
+- **Resume Agent** — extracts only explicit skills and evidence snippets from supplied resume text.
+- **Search Agent** — isolates structured job discovery from general browser execution.
+- **Ranking Agent** — applies Skill + Embedding matching to discovered jobs and writes match scores back to the deduplicated job store.
+- **Browser Agent** — handles research and approved application execution.
+- **Evaluation Agent** — scores execution quality and decides finish vs. replan.
+- **Planner Replan Loop** — retryable failures generate a targeted new agent sequence instead of restarting the full workflow.
+- **Persistent workflow metadata** — tasks store `plan`, `current_agent`, `workflow`, `workflow_thread_id`, retry count and evaluation.
+- **Live Multi-Agent Trace** — the UI shows Planner plans, agent handoffs and the currently active specialist.
 
-## Architecture
+Existing V0.2 capabilities remain: JD parsing, structured Browser Use output, job deduplication, hybrid resume matching, WebSocket trace, SQLite persistence and Human-in-the-loop approval.
+
+## Runtime architecture
 
 ```text
 User
  |
 FastAPI + Web UI
  |
-LangGraph Agent Workflow
- |-- Prepare
- |-- Browser Use Agent
- |-- Evaluation
- |-- Replan / Retry
- |-- Finish
+ v
+Planner Agent
  |
- +----> SQLite Task + Trace
- +----> Deduplicated Job Store
+ +---------------- task-aware plan ----------------+
+ |                                                  |
+ | job_search                                       | research / application
+ v                                                  v
+Resume Agent (optional)                       Resume Agent (optional)
+ |                                                  |
+ v                                                  v
+Search Agent                                    Browser Agent
+ |                                                  |
+ v                                                  |
+Ranking Agent (when resume exists)                  |
+ |                                                  |
+ +------------------------+-------------------------+
+                          v
+                    Evaluation Agent
+                          |
+                +---------+----------+
+                |                    |
+              pass                retryable
+                |                    |
+                v                    v
+              Finish       Planner targeted replan
+                                     |
+                                     +--> Search/Browser -> Evaluate
 
-Resume + JD
- |
-Skill Evidence + Embedding Similarity
- |
-Explainable Match Result
+SQLite
+  |-- task / approval / evaluation
+  |-- plan / current_agent / workflow state
+  |-- trace timeline
+  +-- deduplicated jobs + match score
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for node-level details.
+
+## Agent plans
+
+A job-search task with a resume is canonicalized to:
+
+```text
+Planner
+  -> Resume Agent
+  -> Search Agent
+  -> Ranking Agent
+  -> Evaluation Agent
+```
+
+Without a resume:
+
+```text
+Planner -> Search Agent -> Evaluation Agent
+```
+
+Research:
+
+```text
+Planner -> Browser Agent -> Evaluation Agent
+```
+
+Approved application:
+
+```text
+Planner -> Resume Agent (optional) -> Browser Agent -> Evaluation Agent
+```
+
+The Planner can change objectives for these steps, but high-impact application submission remains controlled by the outer Human-in-the-loop approval gate.
 
 ## Quick start
 
@@ -59,9 +111,9 @@ uvicorn app.main:app --reload --port 8000
 
 Open `http://127.0.0.1:8000`.
 
-### Optional API configuration
+### Optional model configuration
 
-Use Browser Use Cloud:
+Browser Use Cloud:
 
 ```env
 BROWSER_USE_API_KEY=...
@@ -77,33 +129,34 @@ LLM_MODEL=gpt-5-mini
 EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-Without keys, JD parsing and matching remain available in offline fallback mode. Browser execution requires a configured LLM.
+Without keys, Planner preview, JD parsing, Resume Agent extraction and resume/JD matching use deterministic local fallbacks. Real Browser Agent execution requires a configured browser-capable LLM.
 
 ## API
 
-### Parse JD
+### Agent registry
 
 ```http
-POST /api/jd/parse
+GET /api/agents
 ```
 
-### Match resume and JD
+### Preview Planner output
 
 ```http
-POST /api/match
+POST /api/plan
 ```
 
-Returns total score plus `skill_score` and `semantic_score`.
+Example body:
 
-### Ingest jobs
-
-```http
-POST /api/jobs/ingest
+```json
+{
+  "objective": "Find Shanghai AI Agent Engineer jobs and rank them against my resume",
+  "task_type": "job_search",
+  "resume_text": "Python, LangGraph, FastAPI, Agent, RAG...",
+  "auto_execute": false
+}
 ```
 
-Duplicate listings are merged via a stable fingerprint.
-
-### Create Browser Agent task
+### Create Multi-Agent task
 
 ```http
 POST /api/tasks
@@ -121,15 +174,29 @@ Task types:
 POST /api/tasks/{task_id}/approve
 ```
 
-### Live trace
+### Task state + trace
+
+```http
+GET /api/tasks/{task_id}
+```
 
 ```text
 ws://127.0.0.1:8000/ws/tasks/{task_id}
 ```
 
-## Agent safety boundaries
+WebSocket status contains:
 
-JobPilot does not attempt to bypass CAPTCHAs or access controls. It does not invent candidate information. Application tasks are gated by explicit Human-in-the-loop approval, and ambiguous fields should stop submission rather than be guessed.
+- `current_agent`
+- `plan`
+- `workflow`
+- `retry_count`
+- `evaluation`
+
+## Safety boundaries
+
+JobPilot does not attempt to bypass CAPTCHAs or access controls. It does not invent candidate information. Application tasks always require explicit Human-in-the-loop approval. Missing application fields should stop execution rather than be guessed.
+
+The Planner is also constrained: its LLM output is canonicalized against the task type, so an application task cannot silently become an unapproved autonomous submission flow.
 
 ## Tests
 
@@ -137,23 +204,37 @@ JobPilot does not attempt to bypass CAPTCHAs or access controls. It does not inv
 pytest -q
 ```
 
-The unit suite covers offline matching, deduplication, evaluation and replanning logic without requiring browser credentials.
+V0.3-1 adds tests for:
 
-## Resume-ready talking points
+- Planner agent routing;
+- Resume Agent evidence extraction;
+- full offline multi-agent fallback flow;
+- agent handoff traces;
+- Search -> Ranking -> Evaluation completion;
+- existing matching, deduplication, evaluation and replanning logic.
 
-- Used **LangGraph StateGraph** to model an auditable agent lifecycle and conditional retry loop.
-- Integrated **Browser Use structured output** to turn browser observations into typed job records.
-- Built **Skill + Embedding hybrid ranking** with an offline deterministic fallback.
-- Added an **Agent Evaluation** layer and **replanning** rather than treating a completed LLM call as success.
-- Added **Human-in-the-loop** controls for high-impact external actions.
-- Implemented **WebSocket trace** and persistent execution history for debugging and evaluation.
+Current local result:
 
-## Roadmap
+```text
+9 passed
+```
 
-- PostgreSQL + pgvector/Qdrant
-- durable LangGraph checkpointing
-- multi-source scheduled job discovery
-- authenticated browser profiles
-- reranking + personalized search policy
-- benchmark dataset and Agent regression evaluation
-- worker queue / distributed execution
+## Resume-ready engineering points
+
+- Built a **Planner-orchestrated Multi-Agent workflow with LangGraph StateGraph**, separating Resume, Search, Ranking, Browser and Evaluation responsibilities.
+- Designed a **typed Agent Plan and deterministic safety canonicalization layer**, allowing LLM planning without giving the planner authority to bypass execution boundaries.
+- Implemented **agent handoff and workflow-state persistence**, exposing current agent, pending sequence, retry count and evaluation through SQLite + WebSocket.
+- Added a **targeted replanning loop** that retries only the failed Search/Browser branch instead of restarting the whole workflow.
+- Implemented **hybrid ranking for discovered jobs** and persisted match scores into the deduplicated job database.
+- Preserved **Human-in-the-loop** for external application side effects.
+
+## Next stage: V0.3-2
+
+The next stage is intentionally focused on durable knowledge and resume retrieval:
+
+- Resume RAG Agent;
+- resume/document chunking;
+- pgvector or Qdrant vector store;
+- evidence-level retrieval for Ranking Agent;
+- user/job long-term memory;
+- LangGraph persistent checkpointer for resume-after-restart execution.
