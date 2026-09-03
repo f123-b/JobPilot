@@ -1,0 +1,20 @@
+[project]
+name = "jobpilot"
+version = "0.2.0"
+description = "AI Job Search and Browser Agent with LangGraph orchestration"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.9",
+  "python-dotenv>=1.0",
+  "openai>=1.50",
+  "browser-use>=0.13",
+  "langgraph>=0.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

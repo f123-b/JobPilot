@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.9
+python-dotenv>=1.0
+openai>=1.50
+browser-use>=0.13
+langgraph>=0.2
