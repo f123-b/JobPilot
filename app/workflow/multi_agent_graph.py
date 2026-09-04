@@ -21,6 +21,9 @@ from ..schemas import AgentPlanStep, BrowserRunResult, JobCandidate, RankedJob
 from ..services.agent_evaluation import evaluate_run
 from ..services.job_store import ingest_candidates
 from ..services.replanner import replan_objective
+from ..rag.resume_rag import index_resume_text
+from ..memory.store import get_user_preferences, remember_seen_if_new
+from .persistence import checkpoint_context
 
 AgentName = Literal["resume", "search", "ranking", "browser", "evaluate", "finish"]
 
@@ -33,10 +36,12 @@ class MultiAgentState(TypedDict, total=False):
     remaining_steps: list[dict[str, Any]]
     current_agent: str | None
     resume_profile: dict[str, Any]
+    resume_source_id: str | None
     run: dict[str, Any]
     candidates: list[dict[str, Any]]
     ranked_jobs: list[dict[str, Any]]
     evaluation: dict[str, Any]
+    user_memory: dict[str, Any]
     final_status: str
 
 
@@ -88,13 +93,23 @@ async def prepare_node(state: MultiAgentState) -> MultiAgentState:
         current_agent="planner",
         workflow={"attempt": 0, "current_agent": "planner", "remaining_agents": []},
     )
-    db.add_trace(task["id"], "graph_prepare", {"workflow": "multi-agent-v0.3", "thread_id": task.get("workflow_thread_id")})
-    return {"task": task, "attempt": 0, "current_agent": "planner"}
+    user_id = str(task.get("payload", {}).get("user_id") or "default")
+    user_memory = get_user_preferences(user_id)
+    db.add_trace(task["id"], "graph_prepare", {
+        "workflow": "multi-agent-v0.3.2",
+        "thread_id": task.get("workflow_thread_id"),
+        "user_id": user_id,
+        "memory_keys": sorted(user_memory),
+    })
+    return {"task": task, "attempt": 0, "current_agent": "planner", "user_memory": user_memory}
 
 
 async def planner_node(state: MultiAgentState) -> MultiAgentState:
     task = state["task"]
-    plan = await build_plan(task)
+    planning_task = dict(task)
+    if state.get("user_memory"):
+        planning_task["objective"] = task["objective"] + "\nPersistent user preferences: " + json.dumps(state["user_memory"], ensure_ascii=False)
+    plan = await build_plan(planning_task)
     steps = [step.model_dump() for step in plan.steps]
     db.update_task(task["id"], plan=plan.model_dump(), current_agent="planner", workflow={
         "attempt": state.get("attempt", 0),
@@ -115,15 +130,34 @@ async def resume_node(state: MultiAgentState) -> MultiAgentState:
     objective, remaining = _current_step(state, "resume")
     task = state["task"]
     _set_agent(task["id"], "resume", state, remaining)
-    resume_text = str(task.get("payload", {}).get("resume_text") or "")
+    payload = task.get("payload", {})
+    user_id = str(payload.get("user_id") or "default")
+    resume_text = str(payload.get("resume_text") or "")
+    source_id = payload.get("resume_source_id")
+    if not resume_text and source_id:
+        rows = db.list_resume_chunks(user_id=user_id, source_id=str(source_id))
+        resume_text = "\n".join(row.get("content") or "" for row in rows)
     profile = build_resume_profile(resume_text)
+    index_result = None
+    if resume_text.strip():
+        index_result = await index_resume_text(
+            user_id=user_id, text=resume_text, filename=str(source_id or "task-resume.txt"),
+            metadata={"task_id": task["id"]},
+        )
     db.add_trace(task["id"], "resume_agent_result", {
         "objective": objective,
         "skills": profile.skills,
         "evidence_count": len(profile.evidence),
         "experience_years": profile.experience_years,
+        "rag_index": index_result.model_dump() if index_result else None,
     })
-    return {"resume_profile": profile.model_dump(), "remaining_steps": remaining, "current_agent": "resume"}
+    active_source_id = index_result.source_id if index_result else (str(source_id) if source_id else None)
+    return {
+        "resume_profile": profile.model_dump(),
+        "resume_source_id": active_source_id,
+        "remaining_steps": remaining,
+        "current_agent": "resume",
+    }
 
 
 async def search_node(state: MultiAgentState) -> MultiAgentState:
@@ -136,6 +170,9 @@ async def search_node(state: MultiAgentState) -> MultiAgentState:
     ingest_summary: dict[str, Any] = {"received": 0, "inserted": 0, "deduplicated": 0}
     if run.discovered_jobs:
         ingest_summary = ingest_candidates(run.discovered_jobs)
+        user_id = str(task.get("payload", {}).get("user_id") or "default")
+        for candidate in run.discovered_jobs:
+            remember_seen_if_new(user_id, candidate.model_dump())
     db.add_trace(task["id"], "search_agent_result", {
         "success": run.success,
         "candidate_count": len(candidates),
@@ -158,16 +195,34 @@ async def ranking_node(state: MultiAgentState) -> MultiAgentState:
     task = state["task"]
     _set_agent(task["id"], "ranking", state, remaining)
     candidates = [JobCandidate.model_validate(x) for x in state.get("candidates", [])]
-    resume_text = str(task.get("payload", {}).get("resume_text") or "")
-    ranked = await rank_candidates(candidates, resume_text)
+    payload_data = task.get("payload", {})
+    user_id = str(payload_data.get("user_id") or "default")
+    resume_text = str(payload_data.get("resume_text") or "")
+    if not resume_text and payload_data.get("resume_source_id"):
+        resume_text = "\n".join(
+            row.get("content") or ""
+            for row in db.list_resume_chunks(user_id=user_id, source_id=str(payload_data["resume_source_id"]))
+        )
+    ranked = await rank_candidates(
+        candidates,
+        resume_text,
+        user_id=user_id,
+        use_rag=True,
+        preferences=state.get("user_memory") or {},
+        resume_source_id=state.get("resume_source_id") or payload_data.get("resume_source_id"),
+    )
     payload = [x.model_dump() for x in ranked]
     db.add_trace(task["id"], "ranking_agent_result", {
         "objective": objective,
         "ranked_count": len(ranked),
         "top_jobs": [
-            {"title": x.job.title, "company": x.job.company, "score": x.score, "url": x.job.url}
+            {
+                "title": x.job.title, "company": x.job.company, "score": x.score, "url": x.job.url,
+                "evidence_count": len(x.evidence), "memory_status": x.memory_status,
+            }
             for x in ranked[:8]
         ],
+        "rag_grounded": True,
     })
     db.update_task(task["id"], workflow={
         "attempt": state.get("attempt", 0),
@@ -242,7 +297,7 @@ async def replan_node(state: MultiAgentState) -> MultiAgentState:
     steps: list[AgentPlanStep]
     if task["task_type"] == "job_search":
         steps = [AgentPlanStep(agent="search", objective=objective)]
-        if (task.get("payload", {}).get("resume_text") or "").strip():
+        if (task.get("payload", {}).get("resume_text") or "").strip() or task.get("payload", {}).get("resume_source_id"):
             steps.append(AgentPlanStep(agent="ranking", objective="Re-rank the refreshed candidate set against the resume."))
     else:
         steps = [AgentPlanStep(agent="browser", objective=objective)]
@@ -277,6 +332,11 @@ def _result_text(state: MultiAgentState) -> str:
                 "url": item.job.url,
                 "matched_skills": item.matched_skills[:8],
                 "missing_skills": item.missing_skills[:6],
+                "memory_status": item.memory_status,
+                "evidence": [
+                    {"section": e.section, "score": round(e.score, 3), "content": e.content[:240]}
+                    for e in item.evidence[:3]
+                ],
             }
             for item in ranked[:10]
         ]
@@ -314,7 +374,7 @@ async def finish_node(state: MultiAgentState) -> MultiAgentState:
     return {"final_status": status, "current_agent": None}
 
 
-def build_multi_agent_graph():
+def build_multi_agent_graph(checkpointer=None):
     if not LANGGRAPH_AVAILABLE:
         raise RuntimeError("langgraph is not installed; run pip install -r requirements.txt")
 
@@ -338,7 +398,7 @@ def build_multi_agent_graph():
     graph.add_conditional_edges("evaluate", route_after_evaluation, {"replan": "replan", "finish": "finish"})
     graph.add_conditional_edges("replan", _route_next, routes)
     graph.add_edge("finish", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 async def _fallback_workflow(task_id: int) -> None:
@@ -371,11 +431,14 @@ async def _fallback_workflow(task_id: int) -> None:
 async def execute_multi_agent_workflow(task_id: int) -> None:
     try:
         if LANGGRAPH_AVAILABLE:
-            graph = build_multi_agent_graph()
-            await graph.ainvoke(
-                {"task_id": task_id},
-                {"configurable": {"thread_id": f"jobpilot-task-{task_id}"}},
-            )
+            task = db.get_task(task_id) or {}
+            thread_id = str(task.get("workflow_thread_id") or f"jobpilot-task-{task_id}")[:255]
+            async with checkpoint_context() as checkpointer:
+                graph = build_multi_agent_graph(checkpointer=checkpointer)
+                await graph.ainvoke(
+                    {"task_id": task_id},
+                    {"configurable": {"thread_id": thread_id}},
+                )
         else:
             await _fallback_workflow(task_id)
     except Exception as exc:

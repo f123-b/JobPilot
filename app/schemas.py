@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -86,18 +86,36 @@ class ResumeProfile(BaseModel):
     summary: str = ""
 
 
+class ResumeEvidence(BaseModel):
+    source_id: str
+    section: str
+    content: str
+    score: float = Field(ge=0.0, le=1.0)
+
+
+class ResumeIndexResult(BaseModel):
+    user_id: str
+    source_id: str
+    chunk_count: int
+    vector_backend: str
+
+
 class RankedJob(BaseModel):
     job: JobCandidate
     score: int = Field(ge=0, le=100)
     matched_skills: list[str] = Field(default_factory=list)
     missing_skills: list[str] = Field(default_factory=list)
+    evidence: list[ResumeEvidence] = Field(default_factory=list)
+    memory_status: str | None = None
     explanation: str = ""
 
 
 class BrowserTaskRequest(BaseModel):
     objective: str = Field(min_length=10)
     task_type: Literal["research", "job_search", "application"] = "research"
+    user_id: str = Field(default="default", min_length=1, max_length=120)
     resume_text: str | None = None
+    resume_source_id: str | None = None
     job_url: str | None = None
     auto_execute: bool = False
 
@@ -124,3 +142,21 @@ class BrowserRunResult(BaseModel):
     step_count: int = 0
     duration_seconds: float = 0.0
     discovered_jobs: list[JobCandidate] = Field(default_factory=list)
+
+
+class ResumeSearchRequest(BaseModel):
+    user_id: str = Field(default="default", min_length=1, max_length=120)
+    source_id: str | None = None
+    query: str = Field(min_length=3)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class UserMemoryRequest(BaseModel):
+    value: Any
+
+
+class JobMemoryRequest(BaseModel):
+    user_id: str = Field(default="default", min_length=1, max_length=120)
+    job_id: int
+    status: Literal["seen", "saved", "applied", "rejected", "interview", "offer"]
+    note: str | None = None

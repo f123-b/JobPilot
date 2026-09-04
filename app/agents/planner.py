@@ -12,7 +12,7 @@ def heuristic_plan(task: dict[str, Any]) -> AgentPlan:
     """Deterministic fallback so the orchestrator works without an LLM key."""
     task_type = task["task_type"]
     payload = task.get("payload", {})
-    has_resume = bool((payload.get("resume_text") or "").strip())
+    has_resume = bool((payload.get("resume_text") or "").strip() or payload.get("resume_source_id"))
     steps: list[AgentPlanStep] = []
 
     if has_resume and task_type in {"job_search", "application"}:
@@ -40,14 +40,14 @@ async def build_plan(task: dict[str, Any]) -> AgentPlan:
 Return JSON only with: goal, rationale, steps.
 Each step must contain agent and objective. Allowed agents: resume, search, ranking, browser, evaluate.
 Rules:
-- job_search should use search; use resume + ranking only when resume_text exists.
+- job_search should use search; use resume + ranking only when resume_text or resume_source_id exists.
 - research/application should use browser rather than search.
 - evaluate must be the last step.
 - Never add an agent that is unrelated to the user's task.
 - Do not bypass the human-approval gate for application tasks."""
     prompt = (
         f"task_type={task['task_type']}\nobjective={task['objective']}\n"
-        f"resume_present={bool((task.get('payload', {}).get('resume_text') or '').strip())}\n"
+        f"resume_present={bool((task.get('payload', {}).get('resume_text') or '').strip() or task.get('payload', {}).get('resume_source_id'))}\n"
         f"job_url={task.get('payload', {}).get('job_url') or ''}"
     )
     try:
@@ -63,7 +63,7 @@ Rules:
         # introduce unsafe or semantically invalid execution routes.
         objective_by_agent = {step.agent: step.objective for step in cleaned}
         task_type = task["task_type"]
-        has_resume = bool((task.get("payload", {}).get("resume_text") or "").strip())
+        has_resume = bool((task.get("payload", {}).get("resume_text") or "").strip() or task.get("payload", {}).get("resume_source_id"))
         canonical_agents: list[str] = []
         if has_resume and task_type in {"job_search", "application"}:
             canonical_agents.append("resume")

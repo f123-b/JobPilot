@@ -1,225 +1,137 @@
-# JobPilot V0.3-1 Architecture
+# JobPilot V0.3-2 Architecture
 
-## 1. Goal
+## 1. Responsibility split
 
-V0.3-1 converts JobPilot from a single browser-execution graph into a role-separated multi-agent runtime. The main design requirement is not merely "more agents"; each specialist owns a distinct responsibility and the parent graph controls handoffs, retries and safety boundaries.
+| Layer | Responsibility |
+|---|---|
+| Planner Agent | task-aware safe plan generation |
+| Resume Agent | conservative profile extraction + resume indexing |
+| Search Agent | Browser Use structured job discovery |
+| Ranking Agent | Resume RAG retrieval + hybrid ranking + durable memory adjustment |
+| Browser Agent | research / approved application execution |
+| Evaluation Agent | quality gate and retryability decision |
+| Resume Vector Store | pgvector or SQLite vector persistence |
+| Long-term Memory | user preferences + job lifecycle states |
+| LangGraph Checkpointer | thread-scoped graph state persistence |
 
-Specialists:
+## 2. Persistence boundaries
 
-- **Planner Agent** — task decomposition and objective refinement;
-- **Resume Agent** — evidence-grounded candidate profile extraction;
-- **Search Agent** — structured job discovery;
-- **Ranking Agent** — resume/job scoring;
-- **Browser Agent** — research or approved application execution;
-- **Evaluation Agent** — quality gate and retry decision.
+JobPilot intentionally separates three persistence types.
 
-## 2. Parent graph
+### Operational persistence
 
-```text
-START
-  |
-prepare
-  |
-planner
-  |
-  +-- job_search + resume --> resume --> search --> ranking --> evaluate
-  |
-  +-- job_search ----------> search -----------> evaluate
-  |
-  +-- research ------------> browser ----------> evaluate
-  |
-  +-- application + resume -> resume --> browser -> evaluate
-  |
-  +-- application ---------> browser ----------> evaluate
-                                                   |
-                                  +----------------+---------------+
-                                  |                                |
-                                pass                           retryable
-                                  |                                |
-                                  v                                v
-                                finish                           replan
-                                  |                                |
-                                 END               search/browser branch only
-                                                                   |
-                                                               evaluate
-```
+SQLite stores tasks, traces, job records, workflow metadata, user memory and job memory.
 
-`AGENT_MAX_RETRIES` limits replanning loops.
+### Thread persistence
 
-## 3. Planner design
-
-The Planner has two backends:
-
-1. `llm` — produces a structured plan when an OpenAI-compatible model is configured;
-2. `heuristic` — deterministic fallback for local/demo operation.
-
-The LLM does not have final authority over the execution route. Its output is canonicalized using `task_type` and resume availability:
+LangGraph checkpointers persist graph snapshots keyed by `workflow_thread_id`.
 
 ```text
-job_search + resume -> resume, search, ranking, evaluate
-job_search          -> search, evaluate
-research            -> browser, evaluate
-application + resume-> resume, browser, evaluate
-application         -> browser, evaluate
+jobpilot-task-42
+      |
+      +-- planner checkpoint
+      +-- search checkpoint
+      +-- ranking checkpoint
+      +-- evaluation checkpoint
 ```
 
-This design separates **agentic objective planning** from **deterministic safety policy**.
-
-## 4. Shared graph state
-
-The LangGraph state includes:
+Backend order in `auto` mode:
 
 ```text
-task_id
-task
-attempt
-plan
-remaining_steps
-current_agent
-resume_profile
-run
-candidates
-ranked_jobs
-evaluation
-final_status
+POSTGRES_URL present -> AsyncPostgresSaver
+otherwise            -> AsyncSqliteSaver
+package unavailable  -> InMemorySaver
 ```
 
-The SQLite `tasks` table separately persists:
+### Retrieval persistence
+
+Resume chunks and embeddings are stored separately from graph state:
 
 ```text
-plan_json
-workflow_json
-current_agent
-workflow_thread_id
-retry_count
-evaluation_json
+(user_id, source_id, chunk_index, section, content, embedding, metadata)
 ```
 
-`workflow_thread_id` is introduced now so V0.3-2 can attach a persistent LangGraph checkpointer without changing the task identity model.
+With PostgreSQL the embedding column is `vector(VECTOR_DIM)` and queries use cosine distance. The local fallback stores vectors as JSON in SQLite and computes cosine similarity in Python.
 
-## 5. Agent responsibilities
-
-### Planner Agent
-
-Inputs:
-
-- objective;
-- task type;
-- resume presence;
-- target URL.
-
-Outputs:
-
-- `AgentPlan.goal`;
-- rationale;
-- ordered typed `AgentPlanStep[]`.
-
-### Resume Agent
-
-V0.3-1 intentionally does **not** claim full RAG. It extracts conservative, explicit resume evidence:
-
-- recognized skills;
-- verbatim evidence snippets;
-- simple experience-year hints;
-- keywords.
-
-V0.3-2 will replace/extend this with chunk-level vector retrieval.
-
-### Search Agent
-
-Search uses Browser Use as the browser execution engine but is isolated as a specialist role. It must return `DiscoveredJobs`, which is converted to typed `JobCandidate` objects and deduplicated into SQLite.
-
-### Ranking Agent
-
-For bulk ranking, V0.3-1 uses the deterministic hybrid matcher rather than one LLM call per job:
+## 3. Resume indexing
 
 ```text
-score = 0.70 * explicit_skill_score + 0.30 * embedding_similarity
+raw bytes
+  |
+  +-- .txt/.md -> UTF-8
+  +-- .pdf     -> pypdf
+  +-- .docx    -> python-docx
+  |
+  v
+section-aware line normalization
+  |
+  v
+chunking (max chars + overlap)
+  |
+  v
+embedding
+  |
+  v
+replace chunks for (user_id, source_id)
 ```
 
-This keeps cost bounded and ranking reproducible. The direct `/api/match` endpoint may still use an LLM to calibrate a single resume/JD comparison.
+`source_id` includes a content hash so a changed resume becomes a distinct retrieval source.
 
-### Browser Agent
+## 4. Evidence-grounded ranking
 
-Used for:
+For each discovered job:
 
-- general web research;
-- approved application tasks.
+1. Build JD query text.
+2. Retrieve top-k resume chunks for the active user/resume source.
+3. Run deterministic skill + semantic match against retrieved evidence.
+4. Combine match score with retrieval similarity.
+5. Apply persistent preference boosts (currently target location).
+6. Apply long-term job-memory rules (currently rejected-job down-rank).
+7. Return `RankedJob` including evidence and memory status.
 
-Application guardrails remain enforced in the Browser prompt and, more importantly, by the outer approval gate before the graph starts.
+This makes ranking auditable: the UI/API can show which resume lines supported the score.
 
-### Evaluation Agent
+## 5. Long-term memory
 
-The evaluator considers:
+### User memory
 
-- Browser success flag;
-- final-result presence;
-- action history;
-- errors;
-- step count;
-- duration;
-- structured job-candidate count for `job_search`.
+Key-value values scoped by `user_id`.
 
-A `job_search` run with no structured candidates is forced to fail the quality gate even if the browser call itself returned a nominal success.
+Examples:
 
-## 6. Targeted replanning
+- `target_location`
+- `target_role`
+- `salary_expectation`
+- `preferred_industry`
 
-V0.2 retried the generic Browser Agent. V0.3-1 replans the failed branch:
+Planner reloads user memory at workflow start. Search objectives inherit it through the plan and Ranking Agent uses relevant preferences directly.
+
+### Job memory
+
+Lifecycle status scoped by `(user_id, job_fingerprint)`:
 
 ```text
-job_search failure
-  -> Search Agent
-  -> Ranking Agent (if resume exists)
-  -> Evaluation Agent
-
-research/application failure
-  -> Browser Agent
-  -> Evaluation Agent
+seen -> saved -> applied -> interview -> offer
+            \
+             -> rejected
 ```
 
-Completed Resume extraction does not need to run again during a transient browser retry.
+Search marks newly discovered jobs as `seen` without overwriting stronger prior states.
 
-## 7. Observability
+## 6. Recovery path
 
-New trace events include:
-
-- `planner_plan`
-- `agent_handoff`
-- `resume_agent_result`
-- `search_agent_start`
-- `search_agent_result`
-- `ranking_agent_result`
-- `browser_agent_start`
-- `browser_agent_result`
-- `evaluation`
-- `planner_replan`
-- `graph_finish`
-- `workflow_error`
-
-The WebSocket task status also streams the currently active agent and pending workflow sequence.
-
-## 8. Human-in-the-loop
-
-The parent task API is still the security boundary:
+A task is created with a stable thread ID:
 
 ```text
-application
-   |
-waiting_approval
-   |
-explicit approve
-   |
-Multi-Agent graph starts
+workflow_thread_id = jobpilot-task-{task_id}
 ```
 
-Planner output cannot remove this gate because planning occurs only after `prepare_node` verifies approval.
+Normal invocation passes it to LangGraph config. `/api/tasks/{id}/resume` schedules the same task with the same thread ID, allowing a persistent checkpointer to reuse the existing thread state rather than creating an unrelated run.
 
-## 9. V0.3-2 integration points
+## 7. Safety
 
-The graph is prepared for the next phase:
-
-- replace basic Resume Agent extraction with chunked RAG;
-- persist resume embeddings in pgvector/Qdrant;
-- retrieve evidence snippets inside Ranking Agent;
-- add long-term user/job memory;
-- compile the graph with a durable LangGraph checkpointer using `workflow_thread_id`.
+- application tasks always require approval;
+- planner output is canonicalized by task type;
+- missing resume evidence is not fabricated;
+- rejected/applied memory changes ranking but never creates application side effects;
+- CAPTCHAs and access controls are not bypassed.

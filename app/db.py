@@ -80,6 +80,38 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(task_id) REFERENCES tasks(id)
             );
+
+            CREATE TABLE IF NOT EXISTS resume_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                section TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                embedding_backend TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS job_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                job_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                note TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, job_fingerprint)
+            );
             """
         )
         # Backward-compatible migrations from V0.1 / V0.2 databases.
@@ -96,6 +128,8 @@ def init_db() -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs(fingerprint) WHERE fingerprint IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_task_id ON traces(task_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_resume_chunks_user ON resume_chunks(user_id, source_id, chunk_index)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_job_memory_user ON job_memory(user_id, status)")
         conn.commit()
 
 
@@ -267,3 +301,102 @@ def list_traces(task_id: int, after_id: int = 0) -> list[dict[str, Any]]:
             d["detail"] = _load_json(d.pop("detail_json")) or {}
             out.append(d)
         return out
+
+
+def replace_resume_chunks(user_id: str, source_id: str, items: list[dict[str, Any]]) -> None:
+    now = _now()
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM resume_chunks WHERE user_id=? AND source_id=?", (user_id, source_id))
+        conn.executemany(
+            """INSERT INTO resume_chunks(user_id,source_id,chunk_index,section,content,
+               embedding_json,embedding_backend,metadata_json,created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    user_id,
+                    source_id,
+                    int(item["chunk_index"]),
+                    item.get("section") or "resume",
+                    item.get("content") or "",
+                    json.dumps(item.get("embedding") or []),
+                    item.get("embedding_backend") or "unknown",
+                    json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+                    now,
+                )
+                for item in items
+            ],
+        )
+        conn.commit()
+
+
+def list_resume_chunks(user_id: str, source_id: str | None = None) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        if source_id:
+            rows = conn.execute(
+                "SELECT * FROM resume_chunks WHERE user_id=? AND source_id=? ORDER BY chunk_index",
+                (user_id, source_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM resume_chunks WHERE user_id=? ORDER BY id DESC", (user_id,)
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            d["embedding"] = _load_json(d.pop("embedding_json", None)) or []
+            d["metadata"] = _load_json(d.pop("metadata_json", None)) or {}
+            out.append(d)
+        return out
+
+
+def upsert_user_memory(user_id: str, key: str, value: Any) -> dict[str, Any]:
+    now = _now()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO user_memory(user_id,key,value_json,updated_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id,key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at""",
+            (user_id, key, json.dumps(value, ensure_ascii=False, default=str), now),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM user_memory WHERE user_id=? AND key=?", (user_id, key)).fetchone()
+    d = dict(row)
+    d["value"] = _load_json(d.pop("value_json"))
+    return d
+
+
+def list_user_memory(user_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM user_memory WHERE user_id=? ORDER BY key", (user_id,)).fetchall()
+    out=[]
+    for row in rows:
+        d=dict(row); d["value"]=_load_json(d.pop("value_json")); out.append(d)
+    return out
+
+
+def upsert_job_memory(user_id: str, job_fingerprint: str, status: str, note: str | None = None) -> dict[str, Any]:
+    now = _now()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO job_memory(user_id,job_fingerprint,status,note,updated_at) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id,job_fingerprint) DO UPDATE SET status=excluded.status,note=excluded.note,updated_at=excluded.updated_at""",
+            (user_id, job_fingerprint, status, note, now),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM job_memory WHERE user_id=? AND job_fingerprint=?", (user_id, job_fingerprint)
+        ).fetchone()
+    return dict(row)
+
+
+def get_job_memory(user_id: str, job_fingerprint: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM job_memory WHERE user_id=? AND job_fingerprint=?", (user_id, job_fingerprint)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_job_memory(user_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM job_memory WHERE user_id=? ORDER BY updated_at DESC", (user_id,)).fetchall()
+        return [dict(r) for r in rows]

@@ -19,7 +19,12 @@ class Settings:
     openai_base_url: str | None = os.getenv("OPENAI_BASE_URL") or None
     llm_model: str = os.getenv("LLM_MODEL", "gpt-5-mini")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-    local_embedding_dim: int = int(os.getenv("LOCAL_EMBEDDING_DIM", "256"))
+    local_embedding_dim: int = int(os.getenv("LOCAL_EMBEDDING_DIM", "1536"))
+    vector_dim: int = int(os.getenv("VECTOR_DIM", os.getenv("LOCAL_EMBEDDING_DIM", "1536")))
+    vector_backend: str = os.getenv("VECTOR_BACKEND", "auto").lower()
+    postgres_url: str | None = os.getenv("POSTGRES_URL") or None
+    checkpoint_backend: str = os.getenv("CHECKPOINT_BACKEND", "auto").lower()
+    checkpoint_path: Path = Path(os.getenv("CHECKPOINT_PATH", str(BASE_DIR / "data" / "checkpoints.sqlite")))
 
     browser_use_api_key: str | None = os.getenv("BROWSER_USE_API_KEY") or None
     browser_model: str = os.getenv("BROWSER_MODEL", "bu-2-0-mini-preview")

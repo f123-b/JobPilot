@@ -1,9 +1,33 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: jobpilot
+      POSTGRES_USER: jobpilot
+      POSTGRES_PASSWORD: jobpilot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobpilot -d jobpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - jobpilot_pg:/var/lib/postgresql/data
+
   jobpilot:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      POSTGRES_URL: postgresql://jobpilot:jobpilot@postgres:5432/jobpilot
+      VECTOR_BACKEND: postgres
+      CHECKPOINT_BACKEND: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
+
+volumes:
+  jobpilot_pg:
