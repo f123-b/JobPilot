@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -21,15 +21,39 @@ from .services.resume_matcher import match_resume
 from .rag.document_parser import UnsupportedDocumentError, parse_document_bytes
 from .rag.resume_rag import index_resume_text, retrieve_resume_evidence
 from .memory.store import get_user_preferences, remember_job, set_user_preference
+from .runtime.task_worker import TaskWorker
+from .evaluation.benchmark import run_core_benchmark
+from .observability.telemetry import configure_telemetry
 
-app = FastAPI(title=settings.app_name, version="0.3.2")
+app = FastAPI(title=settings.app_name, version="0.4.0")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+OTEL_STATUS = configure_telemetry(app)
+_worker: TaskWorker | None = None
+_worker_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
+    global _worker, _worker_task
     db.init_db()
+    if settings.worker_enabled:
+        _worker = TaskWorker()
+        _worker_task = asyncio.create_task(_worker.run(), name="jobpilot-task-worker")
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global _worker, _worker_task
+    if _worker:
+        _worker.stop()
+    if _worker_task:
+        try:
+            await asyncio.wait_for(_worker_task, timeout=3.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _worker_task.cancel()
+    _worker = None
+    _worker_task = None
 
 
 @app.get("/")
@@ -41,7 +65,7 @@ def index():
 def health():
     return {
         "status": "ok",
-        "version": "0.3.2",
+        "version": "0.4.0",
         "llm_configured": bool(settings.openai_api_key),
         "browser_agent_configured": bool(settings.browser_use_api_key or settings.openai_api_key),
         "workflow": "langgraph-multi-agent",
@@ -50,6 +74,9 @@ def health():
         "vector_backend": settings.vector_backend if settings.postgres_url else "sqlite-local-vector",
         "checkpoint_backend": settings.checkpoint_backend if settings.postgres_url else "sqlite",
         "rag": "resume-evidence",
+        "app_database_backend": db.backend_name(),
+        "durable_queue": settings.worker_enabled,
+        "otel": OTEL_STATUS,
     }
 
 
@@ -104,8 +131,6 @@ async def api_preview_plan(req: BrowserTaskRequest):
 
 @app.post("/api/resume/index")
 async def api_index_resume(request: Request, user_id: str = "default", filename: str = "resume.txt"):
-    # Accept raw document bytes to keep the core server free from multipart-only runtime requirements.
-    # Example: curl --data-binary @resume.pdf '?user_id=u1&filename=resume.pdf'
     content = await request.body()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(413, "resume file too large; max 5 MB")
@@ -143,17 +168,16 @@ def api_set_job_memory(req: JobMemoryRequest):
 
 
 @app.post("/api/tasks")
-async def api_create_task(req: BrowserTaskRequest, background_tasks: BackgroundTasks):
-    # Application has external side effects, so it always requires human approval.
+async def api_create_task(req: BrowserTaskRequest):
     requires_approval = req.task_type == "application" or not req.auto_execute
     task = db.create_task(req.objective, req.task_type, req.model_dump(), requires_approval)
     if not requires_approval:
-        background_tasks.add_task(execute_multi_agent_workflow, task["id"])
+        db.enqueue_task(task["id"])
     return task
 
 
 @app.post("/api/tasks/{task_id}/approve")
-async def api_approve_task(task_id: int, req: ApprovalRequest, background_tasks: BackgroundTasks):
+async def api_approve_task(task_id: int, req: ApprovalRequest):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
@@ -161,12 +185,12 @@ async def api_approve_task(task_id: int, req: ApprovalRequest, background_tasks:
         raise HTTPException(400, "task does not require approval")
     updated = db.approve_task(task_id, req.approved, req.note)
     if req.approved:
-        background_tasks.add_task(execute_multi_agent_workflow, task_id)
+        db.enqueue_task(task_id)
     return updated
 
 
 @app.post("/api/tasks/{task_id}/resume")
-async def api_resume_task(task_id: int, background_tasks: BackgroundTasks):
+async def api_resume_task(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
@@ -176,7 +200,7 @@ async def api_resume_task(task_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(409, "completed task does not need resume")
     db.update_task(task_id, status="queued", error_text=None)
     db.add_trace(task_id, "workflow_resume_requested", {"thread_id": task.get("workflow_thread_id")})
-    background_tasks.add_task(execute_multi_agent_workflow, task_id)
+    db.enqueue_task(task_id)
     return db.get_task(task_id)
 
 
@@ -187,6 +211,53 @@ def api_get_task(task_id: int):
         raise HTTPException(404, "task not found")
     task["traces"] = db.list_traces(task_id)
     return task
+
+
+@app.get("/api/tasks")
+def api_list_tasks(limit: int = 100, status: str | None = None):
+    return db.list_tasks(min(max(limit, 1), 500), status=status)
+
+
+@app.get("/api/tasks/{task_id}/usage")
+def api_task_usage(task_id: int):
+    if not db.get_task(task_id):
+        raise HTTPException(404, "task not found")
+    return {"summary": db.usage_summary(task_id), "events": db.list_usage_events(task_id)}
+
+
+@app.get("/api/queue")
+def api_queue_status():
+    return {
+        "stats": db.queue_stats(),
+        "worker": _worker.snapshot() if _worker else {"running": False},
+        "settings": {
+            "poll_seconds": settings.worker_poll_seconds,
+            "lease_seconds": settings.worker_lease_seconds,
+            "max_attempts": settings.worker_max_attempts,
+        },
+    }
+
+
+@app.get("/api/metrics/summary")
+def api_metrics_summary():
+    return {
+        "database_backend": db.backend_name(),
+        "task_status": db.task_status_counts(),
+        "queue": db.queue_stats(),
+        "usage": db.usage_summary(),
+        "failures": db.failure_counts(),
+        "latest_benchmarks": db.list_benchmark_runs(5),
+    }
+
+
+@app.post("/api/benchmarks/run")
+async def api_run_benchmark():
+    return await run_core_benchmark(persist=True)
+
+
+@app.get("/api/benchmarks")
+def api_benchmarks(limit: int = 20):
+    return db.list_benchmark_runs(min(max(limit, 1), 100))
 
 
 @app.websocket("/ws/tasks/{task_id}")

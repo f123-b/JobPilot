@@ -3,90 +3,56 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>JobPilot V0.3</title>
+  <title>JobPilot V0.4.0</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
-      <div>
-        <span class="eyebrow">AI JOB AGENT · V0.3</span>
-        <h1>JobPilot</h1>
-        <p>Multi-Agent LangGraph · Planner · Search · Ranking · Browser · Evaluation</p>
-      </div>
+      <div><span class="eyebrow">AI JOB AGENT · V0.4.0</span><h1>JobPilot</h1><p>Multi-Agent · Durable Queue · RAG · Memory · Evaluation · Observability</p></div>
       <div id="health" class="status">Checking…</div>
     </header>
-
     <section class="metrics">
       <div class="metric"><span>Orchestrator</span><strong>Planner Agent</strong></div>
       <div class="metric"><span>Execution</span><strong>Multi-Agent Graph</strong></div>
       <div class="metric"><span>Quality Gate</span><strong>Evaluate → Replan</strong></div>
-      <div class="metric"><span>Observability</span><strong>Live Agent Trace</strong></div>
+      <div class="metric"><span>Production</span><strong>Queue + Metrics</strong></div>
     </section>
-
     <nav class="tabs">
       <button class="tab active" data-tab="match">JD / 简历匹配</button>
       <button class="tab" data-tab="agent">Multi-Agent Workflow</button>
       <button class="tab" data-tab="jobs">岗位数据库</button>
+      <button class="tab" data-tab="memory">RAG / Memory</button>
+      <button class="tab" data-tab="ops">Evaluation / Ops</button>
     </nav>
-
     <section id="match" class="panel active">
-      <div class="grid two">
-        <label>招聘 JD<textarea id="jd" placeholder="粘贴岗位描述…"></textarea></label>
-        <label>简历文本<textarea id="resume" placeholder="粘贴你的简历文本…"></textarea></label>
-      </div>
-      <div class="actions">
-        <button id="parseBtn">解析 JD</button>
-        <button id="matchBtn" class="primary">Embedding + Skill 匹配</button>
-      </div>
+      <div class="grid two"><label>招聘 JD<textarea id="jd" placeholder="粘贴岗位描述…"></textarea></label><label>简历文本<textarea id="resume" placeholder="粘贴你的简历文本…"></textarea></label></div>
+      <div class="actions"><button id="parseBtn">解析 JD</button><button id="matchBtn" class="primary">Embedding + Skill 匹配</button></div>
       <pre id="matchOut" class="output">等待输入…</pre>
     </section>
-
     <section id="agent" class="panel">
-      <div class="workflow" id="workflowBar">
-        <div data-agent="planner">Planner</div><b>→</b>
-        <div data-agent="resume">Resume</div><b>→</b>
-        <div data-agent="search">Search</div><b>→</b>
-        <div data-agent="ranking">Ranking</div><b>→</b>
-        <div data-agent="browser">Browser</div><b>→</b>
-        <div data-agent="evaluate">Evaluate</div>
-      </div>
+      <div class="workflow" id="workflowBar"><div data-agent="planner">Planner</div><b>→</b><div data-agent="resume">Resume</div><b>→</b><div data-agent="search">Search</div><b>→</b><div data-agent="ranking">Ranking</div><b>→</b><div data-agent="browser">Browser</div><b>→</b><div data-agent="evaluate">Evaluate</div></div>
       <p class="workflow-note">Planner 会按任务类型选择实际节点；未进入的 Agent 会保持灰色。</p>
       <div class="grid two">
-        <label>任务类型
-          <select id="taskType">
-            <option value="job_search">岗位搜索 + 排序</option>
-            <option value="research">网页研究</option>
-            <option value="application">求职申请（强制人工批准）</option>
-          </select>
-        </label>
+        <label>任务类型<select id="taskType"><option value="job_search">岗位搜索 + 排序</option><option value="research">网页研究</option><option value="application">求职申请（强制人工批准）</option></select></label>
         <label>目标网址（可选）<input id="jobUrl" placeholder="https://…" /></label>
       </div>
       <label>Agent 目标<textarea id="objective" placeholder="例如：搜索上海 AI Agent / LLM 应用开发岗位，优先公司官网，提取岗位、公司、地点、JD和链接，并按我的简历匹配度排序。"></textarea></label>
-      <div class="actions">
-        <button id="planBtn">预览 Planner</button>
-        <button id="runBtn" class="primary">创建 Multi-Agent Workflow</button>
-      </div>
-      <div id="approvalBox" class="approval hidden">
-        <span>任务等待 Human-in-the-loop 批准。</span>
-        <button id="approveBtn">批准执行</button>
-      </div>
-
-      <div class="grid two agent-grid">
-        <div>
-          <h3>任务 / Plan</h3>
-          <pre id="agentOut" class="output compact">等待任务…</pre>
-        </div>
-        <div>
-          <h3>实时 Agent Trace</h3>
-          <div id="traceList" class="trace-list"><div class="muted">尚无事件</div></div>
-        </div>
-      </div>
+      <div class="actions"><button id="planBtn">预览 Planner</button><button id="runBtn" class="primary">创建 Multi-Agent Workflow</button></div>
+      <div id="approvalBox" class="approval hidden"><span>任务等待 Human-in-the-loop 批准。</span><button id="approveBtn">批准执行</button></div>
+      <div class="grid two agent-grid"><div><h3>任务 / Plan</h3><pre id="agentOut" class="output compact">等待任务…</pre></div><div><h3>实时 Agent Trace</h3><div id="traceList" class="trace-list"><div class="muted">尚无事件</div></div></div></div>
     </section>
-
-    <section id="jobs" class="panel">
-      <div class="actions"><button id="refreshJobs">刷新岗位记录</button></div>
-      <div id="jobsList" class="cards"></div>
+    <section id="jobs" class="panel"><div class="actions"><button id="refreshJobs">刷新岗位记录</button></div><div id="jobsList" class="cards"></div></section>
+    <section id="memory" class="panel">
+      <div class="grid two"><label>用户 ID<input id="userId" value="default" /></label><label>简历文件（TXT / MD / PDF / DOCX）<input id="resumeFile" type="file" accept=".txt,.md,.pdf,.docx" /></label></div>
+      <div class="actions"><button id="indexResumeBtn" class="primary">索引简历到 Vector Memory</button></div>
+      <div class="grid two"><label>RAG 查询<input id="ragQuery" placeholder="例如：Python LangGraph RAG Agent 项目经验" /></label><label>长期偏好：目标地点<input id="memoryLocation" placeholder="例如：Shanghai / 上海" /></label></div>
+      <div class="actions"><button id="searchResumeBtn">检索简历证据</button><button id="saveMemoryBtn">保存长期偏好</button><button id="loadMemoryBtn">读取 Memory</button></div>
+      <pre id="memoryOut" class="output">等待操作…</pre>
+    </section>
+    <section id="ops" class="panel">
+      <div class="actions"><button id="refreshMetrics" class="primary">刷新运行指标</button><button id="runBenchmark">运行 Agent Benchmark</button></div>
+      <div class="grid two"><div><h3>Production Metrics</h3><pre id="metricsOut" class="output compact">等待刷新…</pre></div><div><h3>Benchmark</h3><pre id="benchmarkOut" class="output compact">尚未运行…</pre></div></div>
     </section>
   </main>
 <script src="/static/app.js"></script>

@@ -1,7 +1,7 @@
 [project]
 name = "jobpilot"
-version = "0.3.2"
-description = "Multi-agent job search platform with Resume RAG, vector memory and persistent LangGraph checkpoints"
+version = "0.4.0"
+description = "Production-oriented multi-agent job platform with durable queue, RAG, memory, evaluation and observability"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
@@ -18,6 +18,10 @@ dependencies = [
   "pgvector>=0.3",
   "pypdf>=5.0",
   "python-docx>=1.1",
+  "opentelemetry-api>=1.30",
+  "opentelemetry-sdk>=1.30",
+  "opentelemetry-exporter-otlp-proto-http>=1.30",
+  "opentelemetry-instrumentation-fastapi>=0.51b0",
 ]
 
 [project.optional-dependencies]

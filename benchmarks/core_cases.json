@@ -1,0 +1,11 @@
+{
+  "version": "v0.4-core-1",
+  "description": "Deterministic smoke benchmark for JobPilot orchestration, evaluation and failure taxonomy.",
+  "cases": [
+    {"id": "planner_job_search", "capability": "planner-routing"},
+    {"id": "planner_application", "capability": "approval-safe-routing"},
+    {"id": "evaluator_success", "capability": "quality-gate"},
+    {"id": "failure_timeout", "capability": "retry-taxonomy"},
+    {"id": "failure_captcha", "capability": "non-retryable-safety"}
+  ]
+}

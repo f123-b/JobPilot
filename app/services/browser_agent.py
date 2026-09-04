@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..config import settings
 from ..schemas import BrowserRunResult, DiscoveredJobs
+from .usage import record_usage
 
 
 class BrowserAgentUnavailable(RuntimeError):
@@ -25,6 +27,7 @@ def _build_llm():
         if settings.browser_use_api_key:
             from browser_use import ChatBrowserUse
             return ChatBrowserUse(model=settings.browser_model)
+
         if settings.openai_api_key:
             try:
                 from browser_use import ChatOpenAI
@@ -36,6 +39,7 @@ def _build_llm():
             return ChatOpenAI(**kwargs)
     except ImportError as exc:
         raise BrowserAgentUnavailable("browser-use 尚未安装，请执行 pip install -r requirements.txt") from exc
+
     raise BrowserAgentUnavailable("需要配置 BROWSER_USE_API_KEY 或 OPENAI_API_KEY 才能运行 Browser Agent")
 
 
@@ -56,8 +60,13 @@ def build_task_prompt(task: dict[str, Any], objective_override: str | None = Non
     context = f"\n目标网址：{url}" if url else ""
     if resume:
         context += f"\n候选人简历（仅可使用其中明确存在的信息）：\n{resume[:12000]}"
+
     if task_type == "job_search":
-        return f"{objective}\n{context}\n搜索岗位并输出结构化岗位列表。每个岗位包含 title, company, location, url, jd_text, source。不要投递；优先返回可直接访问的原始岗位链接。\n{guardrail}"
+        return (
+            f"{objective}\n{context}\n"
+            "搜索岗位并输出结构化岗位列表。每个岗位包含 title, company, location, url, jd_text, source。"
+            "不要投递；优先返回可直接访问的原始岗位链接。\n" + guardrail
+        )
     if task_type == "application":
         return f"{objective}\n{context}\n本任务已通过人工审批。填写并核对申请；不确定字段不要提交。\n{guardrail}"
     return f"{objective}\n{context}\n完成网页研究任务并返回可核验结果。\n{guardrail}"
@@ -65,13 +74,16 @@ def build_task_prompt(task: dict[str, Any], objective_override: str | None = Non
 
 async def run_browser_agent(task: dict[str, Any], objective_override: str | None = None) -> BrowserRunResult:
     from browser_use import Agent
+
     llm = _build_llm()
     prompt = build_task_prompt(task, objective_override)
     kwargs: dict[str, Any] = {"task": prompt, "llm": llm}
     if task["task_type"] == "job_search":
         kwargs["output_model_schema"] = DiscoveredJobs
+
     agent = Agent(**kwargs)
     history = await agent.run(max_steps=settings.browser_max_steps)
+
     final_result = _safe_call(history, "final_result", None) or ""
     actions = _safe_call(history, "action_names", []) or []
     errors = _safe_call(history, "errors", []) or []
@@ -79,10 +91,12 @@ async def run_browser_agent(task: dict[str, Any], objective_override: str | None
     urls = _safe_call(history, "urls", []) or []
     step_count = int(_safe_call(history, "number_of_steps", 0) or len(actions))
     duration = float(_safe_call(history, "total_duration_seconds", 0.0) or 0.0)
+
     discovered = []
     if task["task_type"] == "job_search" and final_result:
         try:
-            discovered = DiscoveredJobs.model_validate_json(final_result).jobs
+            parsed = DiscoveredJobs.model_validate_json(final_result)
+            discovered = parsed.jobs
         except Exception:
             structured = getattr(history, "structured_output", None)
             if structured:
@@ -91,4 +105,25 @@ async def run_browser_agent(task: dict[str, Any], objective_override: str | None
                     discovered = parsed.jobs
                 except Exception:
                     pass
-    return BrowserRunResult(success=success, final_result=str(final_result), actions=[str(x) for x in actions], errors=[None if x is None else str(x) for x in errors], urls=[str(x) for x in urls], step_count=step_count, duration_seconds=duration, discovered_jobs=discovered)
+
+    record_usage(
+        component="browser_agent",
+        model=settings.browser_model if settings.browser_use_api_key else settings.llm_model,
+        duration_seconds=duration,
+        metadata={
+            "step_count": step_count,
+            "action_count": len(actions),
+            "error_count": len([x for x in errors if x]),
+            "discovered_jobs": len(discovered),
+        },
+    )
+    return BrowserRunResult(
+        success=success,
+        final_result=str(final_result),
+        actions=[str(x) for x in actions],
+        errors=[None if x is None else str(x) for x in errors],
+        urls=[str(x) for x in urls],
+        step_count=step_count,
+        duration_seconds=duration,
+        discovered_jobs=discovered,
+    )

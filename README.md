@@ -1,202 +1,141 @@
 # JobPilot
 
-**JobPilot V0.3-1** is a multi-agent job-search platform built for AI application / Agent engineering practice and portfolio use.
+**JobPilot V0.4.0** is a portfolio-oriented AI job-search Agent platform built around LangGraph orchestration, Browser Use, Resume RAG, long-term memory and a production-style execution runtime.
 
-This stage upgrades V0.2 from a single Browser Agent workflow into a **Planner-orchestrated LangGraph runtime** with specialized Resume, Search, Ranking, Browser and Evaluation agents. The system keeps Human-in-the-loop boundaries for application tasks and persists the generated plan, active agent and workflow state for observability.
+V0.4 moves execution out of FastAPI background execution into a **durable queue + worker** model and adds PostgreSQL application storage, Token/cost accounting, failure taxonomy, an offline Agent benchmark, OpenTelemetry integration and CI.
 
-## What changed in V0.3-1
+## Core capabilities
 
-- **Planner Agent** — decomposes the user goal and produces a typed execution plan. Uses an LLM when configured and a deterministic fallback otherwise.
-- **Safe plan canonicalization** — the planner may refine step objectives, but cannot bypass approval or invent unrelated execution routes.
-- **Resume Agent** — extracts only explicit skills and evidence snippets from supplied resume text.
-- **Search Agent** — isolates structured job discovery from general browser execution.
-- **Ranking Agent** — applies Skill + Embedding matching to discovered jobs and writes match scores back to the deduplicated job store.
-- **Browser Agent** — handles research and approved application execution.
-- **Evaluation Agent** — scores execution quality and decides finish vs. replan.
-- **Planner Replan Loop** — retryable failures generate a targeted new agent sequence instead of restarting the full workflow.
-- **Persistent workflow metadata** — tasks store `plan`, `current_agent`, `workflow`, `workflow_thread_id`, retry count and evaluation.
-- **Live Multi-Agent Trace** — the UI shows Planner plans, agent handoffs and the currently active specialist.
+- **Planner + Multi-Agent LangGraph** — Planner, Resume, Search, Ranking, Browser and Evaluation agents.
+- **Human-in-the-loop** — application tasks cannot execute before explicit approval.
+- **Browser Agent** — Browser Use for search/research/approved application execution.
+- **Resume RAG** — TXT/MD/PDF/DOCX parsing, section-aware chunks, embeddings and JD-specific evidence retrieval.
+- **Vector memory** — pgvector in production; SQLite cosine-search fallback locally.
+- **Long-term memory** — user preferences plus job lifecycle state.
+- **Persistent LangGraph checkpoints** — PostgreSQL or SQLite checkpointer with stable `workflow_thread_id`.
+- **Durable task queue** — worker leases, delayed retry and dead-letter state.
+- **PostgreSQL application DB** — jobs, tasks, traces, memory, queue, usage and benchmarks can share PostgreSQL.
+- **Usage / cost accounting** — LLM and embedding tokens, browser duration/steps, configurable cost estimation.
+- **Failure taxonomy** — timeout/network/rate-limit/captcha/auth/element/model/validation/safety categories.
+- **Agent Benchmark** — deterministic offline regression suite persisted to `benchmark_runs`.
+- **Observability** — database-backed metrics + optional OpenTelemetry traces.
+- **CI** — Python 3.11/3.13 compile, tests and offline benchmark in GitHub Actions.
 
-Existing V0.2 capabilities remain: JD parsing, structured Browser Use output, job deduplication, hybrid resume matching, WebSocket trace, SQLite persistence and Human-in-the-loop approval.
-
-## Runtime architecture
-
-```text
-User
- |
-FastAPI + Web UI
- |
- v
-Planner Agent
- |
- +---------------- task-aware plan ----------------+
- |                                                  |
- | job_search                                       | research / application
- v                                                  v
-Resume Agent (optional)                       Resume Agent (optional)
- |                                                  |
- v                                                  v
-Search Agent                                    Browser Agent
- |                                                  |
- v                                                  |
-Ranking Agent (when resume exists)                  |
- |                                                  |
- +------------------------+-------------------------+
-                          v
-                    Evaluation Agent
-                          |
-                +---------+----------+
-                |                    |
-              pass                retryable
-                |                    |
-                v                    v
-              Finish       Planner targeted replan
-                                     |
-                                     +--> Search/Browser -> Evaluate
-
-SQLite
-  |-- task / approval / evaluation
-  |-- plan / current_agent / workflow state
-  |-- trace timeline
-  +-- deduplicated jobs + match score
-```
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for node-level details.
-
-## Agent plans
-
-A job-search task with a resume is canonicalized to:
+## Architecture
 
 ```text
-Planner
-  -> Resume Agent
-  -> Search Agent
-  -> Ranking Agent
-  -> Evaluation Agent
+Web UI / API
+     |
+   FastAPI
+     |
+ durable task_queue
+     |
+ worker claim + lease
+     |
+ LangGraph Planner
+     |
+ Resume / Search / Ranking / Browser
+     |
+ Evaluation -> pass / replan
+     |
+ terminal state
+
+Persistence:
+  PostgreSQL -> app data, queue, usage, benchmark
+  pgvector   -> Resume RAG
+  Checkpointer -> LangGraph workflow state
+
+Local fallback:
+  SQLite app DB + SQLite vector store + SQLite checkpointer
 ```
 
-Without a resume:
+## Durable execution
 
 ```text
-Planner -> Search Agent -> Evaluation Agent
+POST /api/tasks
+      |
+persist task
+      |
+enqueue
+      |
+worker claim + lease
+      |
+LangGraph workflow
+      |
+      +-- success -> done
+      +-- agent failure -> Evaluate / Replan
+      +-- runtime failure -> delayed retry / dead
 ```
 
-Research:
+Application tasks stay at `waiting_approval` until Human-in-the-loop approval.
 
-```text
-Planner -> Browser Agent -> Evaluation Agent
+## Token / cost accounting
+
+Provider-reported LLM/embedding usage is persisted in `usage_events`; Browser tasks record duration, steps, actions and errors. Prices are configuration-driven:
+
+```env
+LLM_INPUT_COST_PER_1M=0
+LLM_OUTPUT_COST_PER_1M=0
+EMBEDDING_COST_PER_1M=0
 ```
 
-Approved application:
-
-```text
-Planner -> Resume Agent (optional) -> Browser Agent -> Evaluation Agent
-```
-
-The Planner can change objectives for these steps, but high-impact application submission remains controlled by the outer Human-in-the-loop approval gate.
+JobPilot intentionally does not hard-code provider prices.
 
 ## Quick start
 
-Requires Python 3.11+.
+Python 3.11+:
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-
+# Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
-Open `http://127.0.0.1:8000`.
+The embedded worker is enabled by default in local mode.
 
-### Optional model configuration
+## Production-style Docker stack
 
-Browser Use Cloud:
-
-```env
-BROWSER_USE_API_KEY=...
-BROWSER_MODEL=bu-2-0-mini-preview
+```bash
+cp .env.example .env
+docker compose up --build
 ```
 
-Or an OpenAI-compatible provider:
+The stack starts PostgreSQL+pgvector, the FastAPI web process and an independent queue worker.
 
-```env
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=
-LLM_MODEL=gpt-5-mini
-EMBEDDING_MODEL=text-embedding-3-small
+## Main APIs
+
+Agent/task:
+- `POST /api/plan`
+- `POST /api/tasks`
+- `POST /api/tasks/{id}/approve`
+- `POST /api/tasks/{id}/resume`
+- `GET /api/tasks/{id}`
+- `GET /api/tasks`
+
+RAG/memory:
+- `POST /api/resume/index`
+- `POST /api/resume/search`
+- `GET /api/memory/users/{user_id}`
+- `PUT /api/memory/users/{user_id}/{key}`
+- `POST /api/memory/jobs`
+
+Operations/evaluation:
+- `GET /api/queue`
+- `GET /api/metrics/summary`
+- `GET /api/tasks/{id}/usage`
+- `POST /api/benchmarks/run`
+- `GET /api/benchmarks`
+
+## Offline benchmark
+
+```bash
+python -m app.evaluation.benchmark
 ```
 
-Without keys, Planner preview, JD parsing, Resume Agent extraction and resume/JD matching use deterministic local fallbacks. Real Browser Agent execution requires a configured browser-capable LLM.
-
-## API
-
-### Agent registry
-
-```http
-GET /api/agents
-```
-
-### Preview Planner output
-
-```http
-POST /api/plan
-```
-
-Example body:
-
-```json
-{
-  "objective": "Find Shanghai AI Agent Engineer jobs and rank them against my resume",
-  "task_type": "job_search",
-  "resume_text": "Python, LangGraph, FastAPI, Agent, RAG...",
-  "auto_execute": false
-}
-```
-
-### Create Multi-Agent task
-
-```http
-POST /api/tasks
-```
-
-Task types:
-
-- `job_search`
-- `research`
-- `application`
-
-### Approve task
-
-```http
-POST /api/tasks/{task_id}/approve
-```
-
-### Task state + trace
-
-```http
-GET /api/tasks/{task_id}
-```
-
-```text
-ws://127.0.0.1:8000/ws/tasks/{task_id}
-```
-
-WebSocket status contains:
-
-- `current_agent`
-- `plan`
-- `workflow`
-- `retry_count`
-- `evaluation`
-
-## Safety boundaries
-
-JobPilot does not attempt to bypass CAPTCHAs or access controls. It does not invent candidate information. Application tasks always require explicit Human-in-the-loop approval. Missing application fields should stop execution rather than be guessed.
-
-The Planner is also constrained: its LLM output is canonicalized against the task type, so an application task cannot silently become an unapproved autonomous submission flow.
+The deterministic core benchmark covers Planner routing, safe application routing, quality-gate behavior and failure classification.
 
 ## Tests
 
@@ -204,37 +143,27 @@ The Planner is also constrained: its LLM output is canonicalized against the tas
 pytest -q
 ```
 
-V0.3-1 adds tests for:
-
-- Planner agent routing;
-- Resume Agent evidence extraction;
-- full offline multi-agent fallback flow;
-- agent handoff traces;
-- Search -> Ranking -> Evaluation completion;
-- existing matching, deduplication, evaluation and replanning logic.
-
-Current local result:
+## Repository map
 
 ```text
-9 passed
+app/
+├── agents/              # Planner / Resume / Search / Ranking / Browser
+├── evaluation/          # Agent benchmark
+├── memory/              # long-term memory
+├── observability/       # OpenTelemetry integration
+├── rag/                 # parsing / chunking / vector retrieval
+├── runtime/             # durable worker
+├── services/            # LLM, embeddings, usage, failure taxonomy
+├── storage/             # SQLite/PostgreSQL persistence and queue
+├── workflow/            # LangGraph orchestration + checkpoints
+├── db.py                # compatibility facade
+└── main.py              # FastAPI
+
+benchmarks/
+docs/
+.github/workflows/
 ```
 
-## Resume-ready engineering points
+## Validation boundary
 
-- Built a **Planner-orchestrated Multi-Agent workflow with LangGraph StateGraph**, separating Resume, Search, Ranking, Browser and Evaluation responsibilities.
-- Designed a **typed Agent Plan and deterministic safety canonicalization layer**, allowing LLM planning without giving the planner authority to bypass execution boundaries.
-- Implemented **agent handoff and workflow-state persistence**, exposing current agent, pending sequence, retry count and evaluation through SQLite + WebSocket.
-- Added a **targeted replanning loop** that retries only the failed Search/Browser branch instead of restarting the whole workflow.
-- Implemented **hybrid ranking for discovered jobs** and persisted match scores into the deduplicated job database.
-- Preserved **Human-in-the-loop** for external application side effects.
-
-## Next stage: V0.3-2
-
-The next stage is intentionally focused on durable knowledge and resume retrieval:
-
-- Resume RAG Agent;
-- resume/document chunking;
-- pgvector or Qdrant vector store;
-- evidence-level retrieval for Ranking Agent;
-- user/job long-term memory;
-- LangGraph persistent checkpointer for resume-after-restart execution.
+Automated tests validate the SQLite/local path without external services. PostgreSQL/pgvector, live Browser Use and OTLP export require their corresponding external service/credentials and should be verified in an integration deployment before claiming production SLOs.

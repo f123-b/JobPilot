@@ -19,15 +19,32 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    environment:
+    environment: &jobpilot_env
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: postgresql://jobpilot:jobpilot@postgres:5432/jobpilot
       POSTGRES_URL: postgresql://jobpilot:jobpilot@postgres:5432/jobpilot
       VECTOR_BACKEND: postgres
       CHECKPOINT_BACKEND: postgres
+      WORKER_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - ./data:/app/data
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.runtime.worker_main"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: postgresql://jobpilot:jobpilot@postgres:5432/jobpilot
+      POSTGRES_URL: postgresql://jobpilot:jobpilot@postgres:5432/jobpilot
+      VECTOR_BACKEND: postgres
+      CHECKPOINT_BACKEND: postgres
+      WORKER_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   jobpilot_pg:
